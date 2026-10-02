@@ -4,12 +4,10 @@ use bpaf::Bpaf;
 use lazy_static::lazy_static;
 use reqwest::Client;
 use serde_json::Value;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
@@ -74,6 +72,12 @@ struct Cli {
     )]
     limit: usize,
 
+    #[bpaf(
+        long("requests-per-second"),
+        fallback(50)
+    )]
+    requests_per_second: usize,
+
     #[bpaf(long("no-generate"), switch)]
     no_generate: bool,
 
@@ -95,13 +99,18 @@ async fn main() -> eyre::Result<()> {
     println!("              UUIDump");
     println!("========================================");
     println!();
-    println!("Wordlist:   {}", cli.wordlist_path);
-    println!("Output:     {}", cli.output_path);
-    println!("Workers:    {}", cli.theaters);
-    println!("Batch size: {}", cli.batch_size);
-    println!("Limit:      {}", cli.limit);
-    println!("API:        {}", cli.api_url);
+    println!("Wordlist:            {}", cli.wordlist_path);
+    println!("Output:              {}", cli.output_path);
+    println!("Workers:             {}", cli.theaters);
+    println!("Batch size:          {}", cli.batch_size);
+    println!("Limit:               {}", cli.limit);
+    println!("Requests per second: {}", cli.requests_per_second);
+    println!("API:                 {}", cli.api_url);
     println!();
+
+    if cli.requests_per_second == 0 {
+        eyre::bail!("requests-per-second must be greater than 0");
+    }
 
     if !cli.no_generate && !Path::new(&cli.wordlist_path).exists() {
         eprintln!(
@@ -117,6 +126,7 @@ async fn main() -> eyre::Result<()> {
             cli.theaters,
             cli.batch_size,
             cli.limit,
+            cli.requests_per_second,
             &cli.api_url,
         )
         .await?;
@@ -131,6 +141,7 @@ async fn query_wordlist(
     theaters: usize,
     batch_size: usize,
     limit: usize,
+    requests_per_second: usize,
     api_url: &str,
 ) -> eyre::Result<()> {
     if theaters == 0 || batch_size == 0 {
@@ -143,6 +154,11 @@ async fn query_wordlist(
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let writer = Arc::new(Mutex::new(tokio::fs::File::create(output_path).await?));
 
+    // Shared limiter: all workers use the same global request schedule.
+    // This limits the total number of request starts per second, not per worker.
+    let request_interval = Duration::from_secs_f64(1.0 / requests_per_second as f64);
+    let next_request = Arc::new(Mutex::new(Instant::now()));
+
     let status_task = tokio::spawn(async {
         display_status().await;
     });
@@ -152,6 +168,7 @@ async fn query_wordlist(
     for worker_id in 0..theaters {
         let reader = Arc::clone(&reader);
         let tx = tx.clone();
+        let next_request = Arc::clone(&next_request);
         let api_url = api_url.to_string();
 
         workers.push(tokio::spawn(async move {
@@ -162,6 +179,8 @@ async fn query_wordlist(
                 batch_size,
                 limit,
                 &api_url,
+                next_request,
+                request_interval,
             )
             .await
         }));
@@ -172,7 +191,7 @@ async fn query_wordlist(
     while let Some(uuid) = rx.recv().await {
         let mut writer = writer.lock().await;
         writer.write_all(uuid.as_bytes()).await?;
-        writer.write_all(b"\\n").await?;
+        writer.write_all(b"\n").await?;
         UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -212,6 +231,8 @@ async fn worker(
     batch_size: usize,
     limit: usize,
     api_url: &str,
+    next_request: Arc<Mutex<Instant>>,
+    request_interval: Duration,
 ) -> eyre::Result<()> {
     loop {
         if UUID_ALL_COUNTER.load(Ordering::Relaxed) >= limit {
@@ -259,16 +280,48 @@ async fn worker(
             continue;
         }
 
-        request_names(&names, api_url, &tx).await?;
+        request_names(
+            &names,
+            api_url,
+            &tx,
+            &next_request,
+            request_interval,
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+async fn wait_for_request_slot(
+    next_request: &Arc<Mutex<Instant>>,
+    request_interval: Duration,
+) {
+    let wait_duration = {
+        let mut next = next_request.lock().await;
+        let now = Instant::now();
+
+        if *next > now {
+            let wait = *next - now;
+            *next += request_interval;
+            wait
+        } else {
+            *next = now + request_interval;
+            Duration::ZERO
+        }
+    };
+
+    if !wait_duration.is_zero() {
+        sleep(wait_duration).await;
+    }
 }
 
 async fn request_names(
     names: &[String],
     api_url: &str,
     tx: &mpsc::UnboundedSender<String>,
+    next_request: &Arc<Mutex<Instant>>,
+    request_interval: Duration,
 ) -> eyre::Result<()> {
     for name in names {
         let url = format!(
@@ -278,6 +331,9 @@ async fn request_names(
         );
 
         for attempt in 1..=3 {
+            // Every actual HTTP request, including retries, goes through
+            // the same global requests-per-second limiter.
+            wait_for_request_slot(next_request, request_interval).await;
             REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             let response = match CLIENT.get(&url).send().await {
@@ -380,9 +436,4 @@ fn print_status() {
     );
 
     std::io::stdout().flush().ok();
-}
-
-#[allow(dead_code)]
-fn _keep_writer_import() {
-    let _ = BufWriter::new;
 }
